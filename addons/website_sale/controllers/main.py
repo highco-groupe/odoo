@@ -122,14 +122,17 @@ class website_sale(http.Controller):
         cr, uid, context, pool = request.cr, request.uid, request.context, request.registry
         currency_obj = pool['res.currency']
         attribute_value_ids = []
+        visible_attrs = set(l.attribute_id.id
+                                for l in product.attribute_line_ids
+                                    if len(l.value_ids) > 1)
         if request.website.pricelist_id.id != context['pricelist']:
             website_currency_id = request.website.currency_id.id
             currency_id = self.get_pricelist().currency_id.id
             for p in product.product_variant_ids:
                 price = currency_obj.compute(cr, uid, website_currency_id, currency_id, p.lst_price)
-                attribute_value_ids.append([p.id, [v.id for v in p.attribute_value_ids if len(v.attribute_id.value_ids) > 1], p.price, price])
+                attribute_value_ids.append([p.id, [v.id for v in p.attribute_value_ids if v.attribute_id.id in visible_attrs], p.price, price])
         else:
-            attribute_value_ids = [[p.id, [v.id for v in p.attribute_value_ids if len(v.attribute_id.value_ids) > 1], p.price, p.lst_price]
+            attribute_value_ids = [[p.id, [v.id for v in p.attribute_value_ids if v.attribute_id.id in visible_attrs], p.price, p.lst_price]
                 for p in product.product_variant_ids]
 
         return attribute_value_ids
@@ -149,7 +152,6 @@ class website_sale(http.Controller):
                     ('description_sale', 'ilike', srch), ('product_variant_ids.default_code', 'ilike', srch)]
         if category:
             domain += [('public_categ_ids', 'child_of', int(category))]
-
         attrib_list = request.httprequest.args.getlist('attrib')
         attrib_values = [map(int,v.split("-")) for v in attrib_list if v]
         attrib_set = set([v[1] for v in attrib_values])
@@ -187,6 +189,8 @@ class website_sale(http.Controller):
         if category:
             category = pool['product.public.category'].browse(cr, uid, int(category), context=context)
             url = "/shop/category/%s" % slug(category)
+        if attrib_list:
+            post['attrib'] = attrib_list
         pager = request.website.pager(url=url, total=product_count, page=page, step=PPG, scope=7, url_args=post)
         product_ids = product_obj.search(cr, uid, domain, limit=PPG, offset=pager['offset'], order='website_published desc, website_sequence desc', context=context)
         products = product_obj.browse(cr, uid, product_ids, context=context)
@@ -326,6 +330,10 @@ class website_sale(http.Controller):
     @http.route(['/shop/cart/update_json'], type='json', auth="public", methods=['POST'], website=True)
     def cart_update_json(self, product_id, line_id, add_qty=None, set_qty=None, display=True):
         order = request.website.sale_get_order(force_create=1)
+        if order.state != 'draft':
+            request.website.sale_reset()
+            return {}
+
         value = order._cart_update(product_id=product_id, line_id=line_id, add_qty=add_qty, set_qty=set_qty)
         if not display:
             return None
@@ -802,13 +810,23 @@ class website_sale(http.Controller):
 
         # send the email
         if email_act and email_act.get('context'):
+            composer_obj = request.registry['mail.compose.message']
             composer_values = {}
             email_ctx = email_act['context']
-            public_id = request.website.user_id.id
-            if uid == public_id:
+            template_values = [
+                email_ctx.get('default_template_id'),
+                email_ctx.get('default_composition_mode'),
+                email_ctx.get('default_model'),
+                email_ctx.get('default_res_id'),
+            ]
+            composer_values.update(composer_obj.onchange_template_id(cr, SUPERUSER_ID, None, *template_values, context=context).get('value', {}))
+            if not composer_values.get('email_from') and uid == request.website.user_id.id:
                 composer_values['email_from'] = request.website.user_id.company_id.email
-            composer_id = request.registry['mail.compose.message'].create(cr, SUPERUSER_ID, composer_values, context=email_ctx)
-            request.registry['mail.compose.message'].send_mail(cr, SUPERUSER_ID, [composer_id], context=email_ctx)
+            for key in ['attachment_ids', 'partner_ids']:
+                if composer_values.get(key):
+                    composer_values[key] = [(6, 0, composer_values[key])]
+            composer_id = composer_obj.create(cr, SUPERUSER_ID, composer_values, context=email_ctx)
+            composer_obj.send_mail(cr, SUPERUSER_ID, [composer_id], context=email_ctx)
 
         # clean context and session, then redirect to the confirmation page
         request.website.sale_reset(context=context)
@@ -918,5 +936,17 @@ class website_sale(http.Controller):
             }
             ret['lines'] = self.order_lines_2_google_api(order.order_line)
         return ret
+
+    @http.route(['/shop/get_unit_price'], type='json', auth="public", methods=['POST'], website=True)
+    def get_unit_price(self, product_ids, add_qty, use_order_pricelist=False, **kw):
+        cr, uid, context, pool = request.cr, request.uid, request.context, request.registry
+        products = pool['product.product'].browse(cr, uid, product_ids, context=context)
+        partner = pool['res.users'].browse(cr, uid, uid, context=context).partner_id
+        if use_order_pricelist:
+            pricelist_id = request.session.get('sale_order_code_pricelist_id') or partner.property_product_pricelist.id
+        else:
+            pricelist_id = partner.property_product_pricelist.id
+        prices = pool['product.pricelist'].price_rule_get_multi(cr, uid, [], [(product, add_qty, partner) for product in products], context=context)
+        return {product_id: prices[product_id][pricelist_id][0] for product_id in product_ids}
 
 # vim:expandtab:tabstop=4:softtabstop=4:shiftwidth=4:

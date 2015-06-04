@@ -44,7 +44,6 @@ openerp.account = function (instance) {
             this.animation_speed = 100; // "Blocking" animations
             this.aestetic_animation_speed = 300; // eye candy
             this.map_currency_id_rounding = {};
-            this.map_tax_id_amount = {};
             this.presets = {};
             // We'll need to get the code of an account selected in a many2one (whose value is the id)
             this.map_account_id_code = {};
@@ -181,7 +180,6 @@ openerp.account = function (instance) {
             deferred_promises.push(self.model_bank_statement_line
                 .query(['id'])
                 .filter(lines_filter)
-                .order_by('statement_id, id')
                 .all().then(function (data) {
                     self.st_lines = _(data).map(function(o){ return o.id });
                 })
@@ -210,13 +208,6 @@ openerp.account = function (instance) {
                         _.each(data, function(o) { self.map_currency_id_rounding[o.id] = o.rounding });
                     });
 
-                // Create a dict tax id -> amount
-                new instance.web.Model("account.tax")
-                    .query(['id', 'amount'])
-                    .all().then(function(data) {
-                        _.each(data, function(o) { self.map_tax_id_amount[o.id] = o.amount });
-                    });
-            
                 new instance.web.Model("ir.model.data")
                     .call("xmlid_to_res_id", ["account.menu_bank_reconcile_bank_statements"])
                     .then(function(data) {
@@ -242,7 +233,7 @@ openerp.account = function (instance) {
     
                 // Display the reconciliations
                 return self.model_bank_statement_line
-                    .call("get_data_for_reconciliations", [reconciliations_to_show])
+                    .call("get_data_for_reconciliations", [reconciliations_to_show], {context:self.session.user_context})
                     .then(function (data) {
                         var child_promises = [];
                         while ((datum = data.shift()) !== undefined)
@@ -297,7 +288,7 @@ openerp.account = function (instance) {
         keyboardShortcutsHandler: function(e) {
             var self = this;
             if ((e.which === 13 || e.which === 10) && (e.ctrlKey || e.metaKey)) {
-                self.persistReconciliations(_.filter(self.getChildren(), function(o) { return o.is_valid; }));
+                self.persistReconciliations(_.filter(self.getChildren(), function(o) { return o.get("balance").toFixed(3) === "0.000"; }));
             }
         },
 
@@ -514,7 +505,7 @@ openerp.account = function (instance) {
                         }
                     }
                     if (!found)
-                        instance.web.Home(self);
+                        self.do_action('history_back');
                 });
         },
     
@@ -527,7 +518,7 @@ openerp.account = function (instance) {
     
             var time_taken;
             if (sec_taken/60 >= 1) time_taken = Math.floor(sec_taken/60) +"' "+ sec_taken%60 +"''";
-            else time_taken = sec_taken%60 +" seconds";
+            else time_taken = sec_taken%60 +_t(" seconds");
     
             var title;
             if (sec_per_item < 5) title = _t("Whew, that was fast !") + " <i class='fa fa-trophy congrats_icon'></i>";
@@ -689,7 +680,6 @@ openerp.account = function (instance) {
             this.model_tax = new instance.web.Model("account.tax");
             this.map_currency_id_rounding = this.getParent().map_currency_id_rounding;
             this.map_account_id_code = this.getParent().map_account_id_code;
-            this.map_tax_id_amount = this.getParent().map_tax_id_amount;
             this.presets = this.getParent().presets;
             this.is_valid = true;
             this.is_consistent = true; // Used to prevent bad server requests
@@ -1286,7 +1276,7 @@ openerp.account = function (instance) {
             self.is_valid = false;
             self.$(".tip_reconciliation_not_balanced").show();
             self.$(".tbody_open_balance").empty();
-            self.$(".button_ok").text("OK").removeClass("oe_highlight").attr("disabled", "disabled");
+            self.$(".button_ok").text(_t("OK")).removeClass("oe_highlight").attr("disabled", "disabled");
 
             // Find out if the counterpart is lower than, equal or greater than the transaction being reconciled
             var balance_type = undefined;
@@ -1298,13 +1288,13 @@ openerp.account = function (instance) {
             if (balance_type === "equal") {
                 displayValidState(true);
             } else if (balance_type === "greater") {
-                createOpenBalance("Create Write-off");
+                createOpenBalance(_t("Create Write-off"));
             } else if (balance_type === "lower") {
                 if (self.st_line.has_no_partner) {
-                    createOpenBalance("Choose counterpart");
+                    createOpenBalance(_t("Choose counterpart"));
                 } else {
-                    displayValidState(false, "Keep open");
-                    createOpenBalance("Open balance");
+                    displayValidState(false, _t("Keep open"));
+                    createOpenBalance(_t("Open balance"));
                 }
             }
 
@@ -1438,10 +1428,10 @@ openerp.account = function (instance) {
             var deferred_tax = new $.Deferred();
             if (elt === self.tax_id_field || elt === self.amount_field) {
                 var amount = self.amount_field.get("value");
-                var tax = self.map_tax_id_amount[self.tax_id_field.get("value")];
-                if (amount && tax) {
+                var tax_id = self.tax_id_field.get("value");
+                if (amount && tax_id) {
                     deferred_tax = $.when(self.model_tax
-                        .call("compute_for_bank_reconciliation", [self.tax_id_field.get("value"), amount]))
+                        .call("compute_for_bank_reconciliation", [tax_id, amount]))
                         .then(function(data){
                             line_created_being_edited[0].amount_with_tax = line_created_being_edited[0].amount;
                             line_created_being_edited[0].amount = (data.total.toFixed(3) === amount.toFixed(3) ? amount : data.total);
@@ -1604,7 +1594,7 @@ openerp.account = function (instance) {
             limit += 1; // Let's fetch 1 more item than requested
             if (limit > 0) {
                 return self.model_bank_statement_line
-                    .call("get_move_lines_for_reconciliation_by_statement_line_id", [self.st_line.id, excluded_ids, self.filter, offset, limit])
+                    .call("get_move_lines_for_reconciliation_by_statement_line_id", [self.st_line.id, excluded_ids, self.filter, offset, limit], {context:self.session.user_context})
                     .then(function (lines) {
                         _.each(lines, function(line) { self.decorateMoveLine(line, self.st_line.currency_id) }, self);
                         // If we could fetch 1 more item than what we'll display, that means there are move lines left to be displayed (so we enable the pager)
@@ -1764,7 +1754,7 @@ openerp.account = function (instance) {
             this.last_group_by = group_by;
             this.old_search = _.bind(this._super, this);
             var mod = new instance.web.Model("account.move.line", context, domain);
-            return mod.call("list_partners_to_reconcile", []).then(function(result) {
+            return mod.call("list_partners_to_reconcile", [context, domain]).then(function(result) {
                 var current = self.current_partner !== null ? self.partners[self.current_partner][0] : null;
                 self.partners = result;
                 var index = _.find(_.range(self.partners.length), function(el) {

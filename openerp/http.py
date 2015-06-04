@@ -13,6 +13,7 @@ import inspect
 import logging
 import mimetypes
 import os
+import pprint
 import random
 import re
 import sys
@@ -48,6 +49,8 @@ from openerp.tools.func import lazy_property
 from openerp.tools import ustr
 
 _logger = logging.getLogger(__name__)
+rpc_request = logging.getLogger(__name__ + '.rpc.request')
+rpc_response = logging.getLogger(__name__ + '.rpc.response')
 
 # 1 week cache for statics as advised by Google Page Speed
 STATIC_CACHE = 60 * 60 * 24 * 7
@@ -86,8 +89,6 @@ def dispatch_rpc(service_name, method, params):
     in a upper layer.
     """
     try:
-        rpc_request = logging.getLogger(__name__ + '.rpc.request')
-        rpc_response = logging.getLogger(__name__ + '.rpc.response')
         rpc_request_flag = rpc_request.isEnabledFor(logging.DEBUG)
         rpc_response_flag = rpc_response.isEnabledFor(logging.DEBUG)
         if rpc_request_flag or rpc_response_flag:
@@ -200,7 +201,11 @@ class WebRequest(object):
     def env(self):
         """
         The :class:`~openerp.api.Environment` bound to current request.
+        Raises a :class:`RuntimeError` if the current requests is not bound
+        to a database.
         """
+        if not self.db:
+            return RuntimeError('request not bound to a database')
         return openerp.api.Environment(self.cr, self.uid, self.context)
 
     @lazy_property
@@ -235,6 +240,8 @@ class WebRequest(object):
         """
         # can not be a lazy_property because manual rollback in _call_function
         # if already set (?)
+        if not self.db:
+            return RuntimeError('request not bound to a database')
         if not self._cr:
             self._cr = self.registry.cursor()
         return self._cr
@@ -269,7 +276,8 @@ class WebRequest(object):
            to abitrary responses. Anything returned (except None) will
            be used as response.""" 
         self._failed = exception # prevent tx commit
-        if not isinstance(exception, NO_POSTMORTEM):
+        if not isinstance(exception, NO_POSTMORTEM) \
+                and not isinstance(exception, werkzeug.exceptions.HTTPException):
             openerp.tools.debugger.post_mortem(
                 openerp.tools.config, sys.exc_info())
         raise
@@ -394,14 +402,18 @@ def route(route=None, **kw):
             response = f(*args, **kw)
             if isinstance(response, Response) or f.routing_type == 'json':
                 return response
-            elif isinstance(response, werkzeug.wrappers.BaseResponse):
+
+            if isinstance(response, basestring):
+                return Response(response)
+
+            if isinstance(response, werkzeug.exceptions.HTTPException):
+                response = response.get_response(request.httprequest.environ)
+            if isinstance(response, werkzeug.wrappers.BaseResponse):
                 response = Response.force_type(response)
                 response.set_default()
                 return response
-            elif isinstance(response, basestring):
-                return Response(response)
-            else:
-                _logger.warn("<function %s.%s> returns an invalid response type for an http request" % (f.__module__, f.__name__))
+
+            _logger.warn("<function %s.%s> returns an invalid response type for an http request" % (f.__module__, f.__name__))
             return response
         response_wrap.routing = routing
         response_wrap.original_func = f
@@ -542,7 +554,36 @@ class JsonRequest(WebRequest):
         if self.jsonp_handler:
             return self.jsonp_handler()
         try:
+            rpc_request_flag = rpc_request.isEnabledFor(logging.DEBUG)
+            rpc_response_flag = rpc_response.isEnabledFor(logging.DEBUG)
+            if rpc_request_flag or rpc_response_flag:
+                endpoint = self.endpoint.method.__name__
+                model = self.params.get('model')
+                method = self.params.get('method')
+                args = self.params.get('args', [])
+
+                start_time = time.time()
+                _, start_vms = 0, 0
+                if psutil:
+                    _, start_vms = psutil.Process(os.getpid()).get_memory_info()
+                if rpc_request and rpc_response_flag:
+                    rpc_request.debug('%s: %s %s, %s',
+                        endpoint, model, method, pprint.pformat(args))
+
             result = self._call_function(**self.params)
+
+            if rpc_request_flag or rpc_response_flag:
+                end_time = time.time()
+                _, end_vms = 0, 0
+                if psutil:
+                    _, end_vms = psutil.Process(os.getpid()).get_memory_info()
+                logline = '%s: %s %s: time:%.3fs mem: %sk -> %sk (diff: %sk)' % (
+                    endpoint, model, method, end_time - start_time, start_vms / 1024, end_vms / 1024, (end_vms - start_vms)/1024)
+                if rpc_response_flag:
+                    rpc_response.debug('%s, %s', logline, pprint.pformat(result))
+                else:
+                    rpc_request.debug(logline)
+
             return self._json_response(result)
         except Exception, e:
             return self._handle_exception(e)
@@ -861,7 +902,8 @@ class Model(object):
                 raise Exception("Access denied")
             mod = request.registry[self.model]
             meth = getattr(mod, method)
-            cr = request.cr
+            # make sure to instantiate an environment
+            cr = request.env.cr
             result = meth(cr, request.uid, *args, **kw)
             # reorder read
             if method == "read":
@@ -877,6 +919,7 @@ class OpenERPSession(werkzeug.contrib.sessions.Session):
     def __init__(self, *args, **kwargs):
         self.inited = False
         self.modified = False
+        self.rotate = False
         super(OpenERPSession, self).__init__(*args, **kwargs)
         self.inited = True
         self._default_values()
@@ -912,6 +955,7 @@ class OpenERPSession(werkzeug.contrib.sessions.Session):
             uid = dispatch_rpc('common', 'authenticate', [db, login, password, env])
         else:
             security.check(db, uid, password)
+        self.rotate = True
         self.db = db
         self.uid = uid
         self.login = login
@@ -937,6 +981,7 @@ class OpenERPSession(werkzeug.contrib.sessions.Session):
             if not (keep_db and k == 'db'):
                 del self[k]
         self._default_values()
+        self.rotate = True
 
     def _default_values(self):
         self.setdefault("db", None)
@@ -1333,6 +1378,10 @@ class Root(object):
             response = result
 
         if httprequest.session.should_save:
+            if httprequest.session.rotate:
+                self.session_store.delete(httprequest.session)
+                httprequest.session.sid = self.session_store.generate_key()
+                httprequest.session.modified = True
             self.session_store.save(httprequest.session)
         # We must not set the cookie if the session id was specified using a http header or a GET parameter.
         # There are two reasons to this:
